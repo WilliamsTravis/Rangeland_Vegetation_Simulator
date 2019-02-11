@@ -5,39 +5,16 @@ Created on Sun May 28 21:14:48 2017
 @author: Travis
 """
 ################################# Switching to/from Ubuntu VPS ################
-from sys import platform
-import os
-
-if platform == 'win32':
-    from flask_cache import Cache  # This one works on Windows but not Linux
-    import gdal
-    import rasterio
-    import boto3
-    import urllib
-    import botocore
-    def PrintException():
-        exc_type, exc_obj, tb = sys.exc_info()
-        f = tb.tb_frame
-        lineno = tb.tb_lineno
-        filename = f.f_code.co_filename
-        linecache.checkcache(filename)
-        line = linecache.getline(filename, lineno, f.f_globals)
-        print('EXCEPTION IN ({}, LINE {} "{}"): {}'.format(filename,
-              lineno, line.strip(), exc_obj))
-
-    gdal.UseExceptions()
-    print("GDAL version:" + str(int(gdal.VersionInfo('VERSION_NUM'))))
-else:
-    from flask_caching import Cache  # This works on Linux but not Windows :)
-
-###############################################################################
+from collections import OrderedDict
 import copy
 import dash
 from dash.dependencies import Input, Output, State, Event
 import dash_core_components as dcc
 import dash_html_components as html
 import dash_table_experiments as dt
+import gdal
 import gc
+import geopandas as gpd
 import glob
 import json
 from flask import Flask
@@ -48,8 +25,8 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter
 import numpy as np
 import numpy.ma as ma
-from collections import OrderedDict
 import os
+from osgeo import gdal
 import pandas as pd
 import plotly
 import re 
@@ -181,6 +158,254 @@ def basisCheck(usdm,noaa,strike,dm):
     basis[basis == 19998] = 1
     
     return basis
+
+def countyTops(df_path):
+    '''
+    returns data frame with top counties and measurement types as far as record
+    consistency goes.
+    
+    
+    Sorry this is a winded script
+    '''
+    state_abbr = df_path[-6: -4]
+    def knockOff(string):
+        if "<" in string:
+            string = string[:string.index("<")-5]
+        return string
+
+    def toNumber(element):
+        if type(element) is str:
+            element = element.replace(",", "")
+            element = float(element)
+        return element
+    
+    # Clean up the headers and fix the numbers
+    wheat = pd.read_csv(df_path)
+    wheat.columns = [c.lower() for c in wheat.columns]
+    filters = [c for c in wheat.columns if 'cv (%)' not in c]
+    wheat = wheat[filters]
+    wheat.columns = [knockOff(c) for c in wheat.columns]
+    measurements = [c for c in wheat.columns if 'wheat' in c]
+    admin = wheat[['year', 'county', 'state', 'ag district']]
+    observations = wheat[measurements]
+    observations = observations.applymap(toNumber)
+    wheat = admin.join(observations)
+
+    # this is for consistenty checking
+    c_df = wheat[measurements]
+    c_codes = {i: measurements[i] for i in range(len(measurements))}
+    c_codes_inv = {value: key for key, value in c_codes.items()}
+    c_df.columns = list(c_codes.keys())
+
+    # Create a field of ones's and nans
+    for i in range(c_df.shape[1]):
+        c_df[i] = c_df[i] * 0 + 1
+    c_df = admin.join(c_df)
+    
+    # Group by county, state, and ag district and add up the ones
+    c_df = c_df.groupby(['county', 'state', 'ag district']).sum()
+    c_df = c_df.drop(['year'], axis=1)
+    locations = pd.DataFrame(c_df.index.values.tolist(),index=c_df.index)
+    c_df[['county', 'state', 'ag district']] = locations
+    order = list(c_df.columns)
+    [order.insert(0, c) for c in ['ag district', 'state', 'county']]
+    c_df = c_df[order]
+    
+    # Now let's query which measurements have the most observations
+    # the maximum is
+    max_range = max(wheat['year']) - min(wheat['year']) + 1
+    max_measurements = {}
+    for i in range(len(measurements)):
+        max_measurements[c_codes[i]] = max(c_df[i])
+    mm = pd.DataFrame([max_measurements]).T
+    mm.columns = ['observations']
+    mm['ratio'] = mm['observations'].apply(lambda x: (x/ max_range) * 100)
+    mm['measures'] = mm.index
+    
+    # Now, for the top measurement types, which counties have the most.
+    tops = mm.measures[mm.observations == max(mm.observations)].tolist()
+    tops_idx = [c_codes_inv[c] for c in tops]
+    [tops_idx.insert(0, c) for c in ['ag district', 'state', 'county']]
+    county_df = c_df[tops_idx]
+
+    # these happen in fours, there are often multiple measruements and counties
+    # that equal the top.  Just picks first.
+    entry_list = []
+    for i in tops:
+        cm_dict = {}
+        max_m = np.nanmax(wheat[i])
+        counties = wheat.county[wheat[i] == max_m].tolist()
+        cm_dict['county'] = counties[0]
+        cm_dict['observation'] = i
+        entry_list.append(cm_dict)
+    top_counties = pd.DataFrame(entry_list)
+    
+    # Same for irrigated
+    nimm = mm[mm.measures.str.contains('non-irrigated')]
+    tops_i = nimm.measures[nimm.observations == max(nimm.observations)]
+    tops_i_idx = [c_codes_inv[c] for c in tops_i]
+    [tops_i_idx.insert(0, c) for c in ['ag district', 'state', 'county']]
+    county_i_df = c_df[tops_i_idx]
+
+    # build df
+    entry_list = []
+    for i in tops_i:
+        cm_dict = {}
+        max_m = np.nanmax(wheat[i])
+        counties = wheat.county[wheat[i] == max_m].tolist()
+        cm_dict['county'] = counties[0]
+        cm_dict['observation'] = i
+        entry_list.append(cm_dict)
+    top_counties_irrigated = pd.DataFrame(entry_list)
+
+    # Now, if there's a majority county i think we choose that one!
+    both_counties = []
+    for c in top_counties.county:
+        both_counties.append(c)
+    for c in top_counties_irrigated.county:
+        both_counties.append(c)
+        
+    chosen_county = max(set(both_counties), key=both_counties.count)
+    
+    # Now find neighbors
+    state = wheat.state.unique()[0]
+    state_info = pd.read_csv('data/us-state-ansi-fips.csv')
+    state_info.stname = state_info.stname.apply(lambda x: x.upper())
+    state_fip = state_info.st[state_info.stname == state]
+    state_fip = "{:02d}".format(int(state_fip))
+
+    # Get county shapefile
+    all_counties = gpd.read_file('data\\cb_2017_us_county_500k.shp')
+    all_counties['NAME'] = all_counties['NAME'].apply(lambda x: x.upper())
+    state_df = all_counties[all_counties.STATEFP == state_fip]
+    
+    # Use the modal county from above
+    index = state_df.index[state_df.NAME == chosen_county]
+
+    # Now this is tricky. This checks if any point in any other shape touches
+    # any point in our chosen geometry
+    our_row = all_counties.iloc[index]
+    neighbors = []
+    for index, row in state_df.iterrows():
+        if row.geometry.touches(our_row.geometry.iloc[0]):
+            neighbors.append(row.NAME)
+    neighbors.append(chosen_county)
+
+    # Now we simply query the original df (wheat) for our counties and
+    # fields
+    # which wheat crop?
+    crop_ni = top_counties.observation[top_counties.county == chosen_county]
+    crop_ni = crop_ni.tolist()[0]
+    crop_ni = crop_ni[0: crop_ni.index(" - ")]
+    fields = [f for f in wheat.columns if crop_ni in f]
+    observations = fields.copy()
+    [fields.insert(0, c) for c in ['ag district', 'state', 'county', 'year']]
+    df = wheat[fields]
+    df = df[df.county.isin(neighbors)]
+    
+    # standardize the format for RVS data
+    dfs = []
+    for o in observations:
+        sub_df = df[['year', 'county', 'state', 'ag district', o]]
+        sub_df['type'] = o
+        units = [s for s in o.split() if s in ['bu', 'acre', 'acres']]
+        units = "_".join(units)
+        sub_df['units'] = units
+        sub_df.columns = ['year', 'county', 'state', 'ag_district', 'yield',
+                          'type', 'units']
+        dfs.append(sub_df)
+
+    final_df = pd.concat(dfs)
+    
+    def addStar(string):
+        if string is chosen_county:
+            string = string + '*'
+        return string
+
+    final_df.county = final_df.county.apply(addStar)
+
+    # for rvs do this
+    neighbors = [n.lower() + "_" + state_abbr for n in neighbors]
+
+    # Finally, this
+    final_df.to_csv(os.path.join('data', state_abbr + '_data.csv'),
+                    na_rep='nan', index=False)
+    return neighbors
+
+
+def countyRVS(counties):
+    '''
+    counties have to be lower case with a state acronym like this:
+        'county_st'
+    '''
+    # Set up data path
+    prefab_path = "D:\\data\\RPMS_RangeProd_For_Posting\\tifs\\nad83"
+    
+    # Clip counties - the whole thing is too big
+    all_counties = gpd.read_file('data/cb_2017_us_county_500k.shp')
+    state_info = pd.read_csv('data/us-state-ansi-fips.csv')
+
+    # Create individual county shapes
+    def getCounty(all_counties, county_string):
+        all_counties['NAME'] = all_counties['NAME'].apply(lambda x: x.upper())
+        state_abbr = county_string.split('_')[-1].upper()
+        county_name = " ".join(county_string.split('_')[:-1]).upper()
+        state_fips = state_info.st[state_info.stusps == state_abbr]
+        state_fips = "{:02d}".format(int(state_fips))
+        county = all_counties[(all_counties['NAME'] == county_name) &
+                              (all_counties['STATEFP'] == state_fips)]
+        # Write this to a temporary file in the repository
+        county.to_file('data/temp_county.shp')
+        return [county_name, state_abbr]
+    
+    # This helps with naming
+    years = {i: 1983 + i for i in range(1, 36)}
+    
+    # Create a clipped county rvs rasters for each county (then delete?)
+    rvs_dfs = []
+    for county_string in tqdm(counties, position=0):
+        [county_name, state_abbr] = getCounty(all_counties, county_string)
+        means = {}
+    
+        # clip each huge rvs tiff to a small rvs tiff
+        for f in glob.glob(os.path.join(prefab_path, "*tif")):
+            name = os.path.basename(f).split('.')[0]
+            index = int("".join([s for s in name[-2:] if s.isnumeric()]))
+            year = years[index]     
+            output = 'data/rvs_clips/clip.tif'.format(year)
+            gdal.Warp(output, f,
+                      cutlineDSName='data/temp_county.shp',
+                      cropToCutline=True)
+            clip_info = gdal.Info('data/rvs_clips/clip.tif', options=['-stats'])
+            clip_info = clip_info.split('\n')
+            clip_info = [c for c in clip_info if "STATISTICS_MEAN" in c][0]
+            mean = float(clip_info[clip_info.index('=') + 1:])
+            means[year] = mean
+        
+        # Create df
+        df = pd.DataFrame([means]).T
+        df.columns = ['yield']
+        df['county'] = county_name
+        df['state'] = state_abbr
+        rvs_dfs.append(df)
+    
+    # Create one dataframe
+    rvs_df = pd.concat(rvs_dfs)
+    rvs_df['year'] = rvs_df.index
+    state_info.columns = ['state_name', 'st', 'state']
+    state_info['state_name'] = state_info['state_name'].apply(lambda x: x.upper())
+    rvs_df = rvs_df.merge(state_info, on='state', how='inner')
+    rvs_df['type'] = 'rangeland'
+#    rvs_df['yield'] = rvs_df['yield'].apply(lambda x: x/60)  # lb/bu for wheat
+#    rvs_df['units'] = 'bu_acre'
+    rvs_df['units'] = 'lb_acre'
+    rvs_df = rvs_df.reset_index()
+    rvs_df = rvs_df.drop(['index'], axis=1)
+    rvs_df = rvs_df[['year', 'county', 'state_name', 'yield', 'type', 'units']]
+    rvs_df.columns = ['year', 'county', 'state', 'yield', 'type',
+                      'units']
+    rvs_df.to_csv('data/rvs_data.csv', index=False, na_rep='nan')
+
 
 ###########################################################################
 ############## Finding Average Cellwise Coefficients of Variance ##########
